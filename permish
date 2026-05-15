@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+permish: Run a command under OS-enforced sandbox with declared permissions.
+
+The intent: an AI agent declares what permissions a command needs.
+If the agent is wrong (the command tries to do more than declared), the OS
+denies the syscall and the command exits non-zero. You don't have to read
+or audit what the command actually does — the kernel does it for you.
+
+Usage:
+    permish --mode MODE [options] -- COMMAND [ARGS...]
+
+Modes:
+    read          Read anywhere. No writes. No network.
+    write         Read anywhere. Write workspace + /tmp. NOT .git. No network.
+    write-net     Same as `write` plus network access.
+    write-git     Same as `write` but can also write to .git/.
+    write-git-net Same as `write-git` plus network access.
+    full          No restrictions. Escape hatch — equivalent to running unwrapped.
+
+Examples:
+    # Agent declares this git command is read-only; if it tries to push, denied
+    permish --mode read -- git log --stat master..HEAD
+
+    # Agent declares this script writes the workspace but won't touch .git
+    permish --mode write -- python process.py < input.csv
+
+    # Agent needs to install a package (network + .git for hooks)
+    permish --mode write-git-net -- npm install
+
+Backend:
+    Linux  → bubblewrap (bwrap) + network namespace
+    macOS  → sandbox-exec with Seatbelt policy
+    Windows → not supported (use WSL2 with bubblewrap)
+
+Author: built for VS Code / generic AI agent workflows.
+License: MIT — do whatever you want.
+"""
+
+import argparse
+import os
+import platform
+import shutil
+import sys
+from pathlib import Path
+from typing import List
+
+
+MODES = ["read", "write", "write-net", "write-git", "write-git-net", "full"]
+
+MODE_DESCRIPTIONS = {
+    "read":          "read anywhere · no writes · no network",
+    "write":         "read anywhere · write workspace+/tmp (not .git) · no network",
+    "write-net":     "read anywhere · write workspace+/tmp (not .git) · network ON",
+    "write-git":     "read anywhere · write workspace+/tmp INCLUDING .git · no network",
+    "write-git-net": "read anywhere · write workspace+/tmp INCLUDING .git · network ON",
+    "full":          "NO SANDBOX (escape hatch)",
+}
+
+
+def mode_flags(mode: str):
+    """Returns (writes_allowed, write_git, network) for a given mode."""
+    return {
+        "read":          (False, False, False),
+        "write":         (True,  False, False),
+        "write-net":     (True,  False, True),
+        "write-git":     (True,  True,  False),
+        "write-git-net": (True,  True,  True),
+        "full":          (True,  True,  True),
+    }[mode]
+
+
+# -----------------------------------------------------------------------------
+# Linux backend: bubblewrap
+# -----------------------------------------------------------------------------
+
+def build_bwrap_command(mode: str, workspace: Path, command: List[str],
+                       read_extra: List[str], write_extra: List[str]) -> List[str]:
+    writes, write_git, network = mode_flags(mode)
+
+    if mode == "full":
+        # No sandbox at all — just run the command. We'll signal this to main().
+        return command
+
+    args = [
+        "bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--hostname", "sandbox",
+        # ro-bind / first; subsequent mounts overlay on top of it.
+        "--ro-bind", "/", "/",
+        # Then overlay /proc, /dev, /tmp as functional mounts.
+        "--proc", "/proc",
+        "--dev", "/dev",
+        # Fresh writable tmpfs for /tmp — gone when the command exits
+        "--tmpfs", "/tmp",
+    ]
+
+    # Network: --unshare-net puts us in a fresh netns with no interfaces.
+    # Drop it to inherit the host network namespace.
+    if not network:
+        args += ["--unshare-net"]
+
+    # Filesystem writes
+    # In every mode we explicitly bind the workspace so it survives the /tmp
+    # tmpfs overlay (in case workspace is under /tmp) and so the user's
+    # workspace path is always present inside the sandbox.
+    ws = str(workspace)
+    if writes:
+        args += ["--bind", ws, ws]
+
+        # Protect .git unless explicitly allowed
+        if not write_git:
+            git_dir = workspace / ".git"
+            if git_dir.exists():
+                # Re-bind .git as read-only on top of the rw workspace bind
+                args += ["--ro-bind", str(git_dir), str(git_dir)]
+    else:
+        # read mode: workspace is visible but read-only.
+        args += ["--ro-bind", ws, ws]
+
+    # Extra read-only paths
+    for p in read_extra:
+        args += ["--ro-bind-try", p, p]
+
+    # Extra writable paths
+    for p in write_extra:
+        args += ["--bind-try", p, p]
+
+    # Working directory inside the sandbox
+    args += ["--chdir", str(workspace)]
+
+    # Preserve env (bwrap inherits by default; we just don't strip it)
+    args += ["--"] + command
+    return args
+
+
+# -----------------------------------------------------------------------------
+# macOS backend: sandbox-exec + Seatbelt
+# -----------------------------------------------------------------------------
+
+def build_sandbox_exec_command(mode: str, workspace: Path, command: List[str],
+                               read_extra: List[str], write_extra: List[str]) -> List[str]:
+    writes, write_git, network = mode_flags(mode)
+
+    if mode == "full":
+        return command
+
+    parts = [
+        "(version 1)",
+        "(deny default)",
+        # The basics any process needs
+        "(allow process-fork)",
+        "(allow process-exec)",
+        "(allow signal (target self))",
+        "(allow sysctl-read)",
+        "(allow mach-lookup)",
+        "(allow ipc-posix-shm)",
+        "(allow iokit-open)",
+        "(allow file-read-metadata)",
+        # Reads — broad. Same philosophy as Codex: reading is always fine.
+        "(allow file-read*)",
+    ]
+
+    if writes:
+        # Workspace + tmp are writable
+        parts.append(f'(allow file-write* (subpath "{workspace}"))')
+        parts.append('(allow file-write* (subpath "/tmp"))')
+        parts.append('(allow file-write* (subpath "/private/tmp"))')
+        parts.append('(allow file-write* (subpath "/private/var/folders"))')
+        parts.append('(allow file-write* (subpath "/var/folders"))')
+
+        if not write_git:
+            parts.append(f'(deny file-write* (subpath "{workspace}/.git"))')
+
+    for p in read_extra:
+        parts.append(f'(allow file-read* (subpath "{Path(p).resolve()}"))')
+
+    for p in write_extra:
+        parts.append(f'(allow file-write* (subpath "{Path(p).resolve()}"))')
+
+    if network:
+        parts.append("(allow network*)")
+    else:
+        # Allow local loopback + DNS resolver socket so common tools don't break
+        # weirdly. If you want truly zero network, drop these two lines.
+        parts.append('(allow network* (local ip "localhost:*"))')
+        parts.append('(allow network-outbound (path "/private/var/run/mDNSResponder"))')
+
+    profile = "\n".join(parts)
+    return ["sandbox-exec", "-p", profile] + command
+
+
+# -----------------------------------------------------------------------------
+# Driver
+# -----------------------------------------------------------------------------
+
+def detect_backend():
+    system = platform.system()
+    if system == "Linux":
+        if not shutil.which("bwrap"):
+            sys.stderr.write(
+                "permish: bubblewrap (bwrap) not installed.\n"
+                "  Debian/Ubuntu : sudo apt install bubblewrap\n"
+                "  Fedora        : sudo dnf install bubblewrap\n"
+                "  Arch          : sudo pacman -S bubblewrap\n"
+            )
+            sys.exit(127)
+        return "bwrap"
+    if system == "Darwin":
+        if not shutil.which("sandbox-exec"):
+            sys.stderr.write(
+                "permish: sandbox-exec not found (should be on every macOS).\n"
+            )
+            sys.exit(127)
+        return "sandbox-exec"
+    sys.stderr.write(
+        f"permish: unsupported OS: {system}.\n"
+        "  On Windows, run permish inside WSL2 with bubblewrap installed.\n"
+    )
+    sys.exit(127)
+
+
+def banner(mode: str, workspace: Path, command: List[str]):
+    """Print one-line sandbox banner to stderr so users see what was declared."""
+    desc = MODE_DESCRIPTIONS[mode]
+    icon = {
+        "read": "👁  READ",
+        "write": "✏️  WRITE",
+        "write-net": "🌐 WRITE+NET",
+        "write-git": "🔧 WRITE+.git",
+        "write-git-net": "🔧🌐 WRITE+.git+NET",
+        "full": "⚠️  FULL (no sandbox)",
+    }[mode]
+    sys.stderr.write(f"[permish] {icon}  cwd={workspace}\n")
+    sys.stderr.write(f"[permish] policy: {desc}\n")
+    sys.stderr.write(f"[permish] cmd: {' '.join(command)}\n")
+    sys.stderr.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="permish",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--mode", required=True, choices=MODES,
+        help="Declared permissions for this command. The kernel enforces it.",
+    )
+    parser.add_argument(
+        "--workspace", default=os.getcwd(),
+        help="Workspace root (default: cwd). Writes are confined here in write modes.",
+    )
+    parser.add_argument(
+        "--read", dest="read_extra", action="append", default=[],
+        metavar="PATH",
+        help="Extra read-only path beyond /. Repeatable.",
+    )
+    parser.add_argument(
+        "--write", dest="write_extra", action="append", default=[],
+        metavar="PATH",
+        help="Extra writable path beyond workspace. Repeatable.",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Suppress the [permish] banner on stderr.",
+    )
+    parser.add_argument(
+        "--explain", action="store_true",
+        help="Print the sandbox command that would run, then exit 0.",
+    )
+    parser.add_argument(
+        "command", nargs=argparse.REMAINDER,
+        help="Command to run (precede with -- to be safe).",
+    )
+
+    args = parser.parse_args()
+
+    # Strip a leading "--" if argparse left it in (it does, with REMAINDER).
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        parser.error("no command supplied — put the command after `--`")
+
+    workspace = Path(args.workspace).resolve()
+    if not workspace.exists():
+        sys.stderr.write(f"permish: workspace {workspace} does not exist\n")
+        sys.exit(2)
+
+    backend = detect_backend()
+
+    if backend == "bwrap":
+        wrapped = build_bwrap_command(
+            args.mode, workspace, command, args.read_extra, args.write_extra,
+        )
+    else:
+        wrapped = build_sandbox_exec_command(
+            args.mode, workspace, command, args.read_extra, args.write_extra,
+        )
+
+    if not args.quiet:
+        banner(args.mode, workspace, command)
+
+    if args.explain:
+        sys.stderr.write("[permish] would exec:\n  " + " ".join(wrapped) + "\n")
+        return 0
+
+    # exec replaces this process — child's exit code becomes ours
+    try:
+        os.execvp(wrapped[0], wrapped)
+    except FileNotFoundError as e:
+        sys.stderr.write(f"permish: {e}\n")
+        sys.exit(127)
+
+
+if __name__ == "__main__":
+    main()
