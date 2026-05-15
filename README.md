@@ -2,10 +2,10 @@
 
 OS-enforced sandbox for AI agent tool calls.
 
-The agent declares what permissions a command needs (`read`, `write`, `write-net`, etc).
-If the command tries to do more than declared, the **kernel** denies the syscall and the
-command exits non-zero. You don't have to audit what the command actually does — the OS
-does it for you.
+The agent declares what permissions a command needs — flags like `--write`, `--net`,
+`--write-git` — and they compose freely. If the command tries to do more than declared,
+the **kernel** denies the syscall and the command exits non-zero. You don't have to audit
+what the command actually does — the OS does it for you.
 
 This is the same idea OpenAI's Codex CLI uses internally (Landlock + seccomp on Linux,
 Seatbelt on macOS), packaged as a standalone wrapper you can put in front of *any* agent —
@@ -13,18 +13,20 @@ Copilot agent mode, Claude Code, Cursor, Cline, your own scripts, whatever.
 
 ## What it does
 
-| Mode            | Reads | Writes workspace | Writes `.git` | Network |
-| --------------- | ----- | ---------------- | ------------- | ------- |
-| `read`          | ✅    | ❌               | ❌            | ❌      |
-| `write`         | ✅    | ✅               | ❌            | ❌      |
-| `write-net`     | ✅    | ✅               | ❌            | ✅      |
-| `write-git`     | ✅    | ✅               | ✅            | ❌      |
-| `write-git-net` | ✅    | ✅               | ✅            | ✅      |
-| `full`          | —    | —                | —             | —       |
+Flags compose freely. Start with no flags (read-only, anywhere) and add what you need:
 
-`/tmp` is always a fresh tmpfs that disappears when the command exits, regardless of mode.
-Reads are unrestricted in every mode except `full` (which has no sandbox). This matches the
-Codex model — reading is rarely the threat; writes and network are.
+| Flag            | Effect                                                              |
+| --------------- | ------------------------------------------------------------------- |
+| *(none)*        | Read anywhere on the filesystem. No writes. No network. (default)  |
+| `--read-local`  | Restrict reads to the workspace. Blocks reading `~/.ssh`, other projects, etc. |
+| `--write`       | Write to workspace + `/tmp`. `.git` stays read-only.               |
+| `--write-git`   | Write to workspace including `.git` (implies `--write`).            |
+| `--net`         | Allow network access.                                               |
+| `--full`        | No restrictions. Escape hatch.                                      |
+
+Flags combine: `--write --net`, `--write-git --net`, `--read-local --write`, etc.
+
+`/tmp` is always a fresh tmpfs that disappears when the command exits.
 
 ## Why you want this
 
@@ -59,24 +61,29 @@ Run inside WSL2 with bubblewrap installed. Native Windows is not supported (yet)
 ## Usage
 
 ```bash
-permish --mode read         -- git log --stat master..HEAD
-permish --mode write        -- python process.py
-permish --mode write-net    -- pip install requests
-permish --mode write-git    -- git commit -am 'wip'
-permish --mode write-git-net -- git push
-permish --mode full         -- some-command-you-fully-trust  # escape hatch
+permish --              git log --stat master..HEAD  # read anywhere (default)
+permish --read-local -- grep -r TODO .               # read only within workspace
+permish --write      -- python process.py
+permish --write --net   -- pip install requests
+permish --write-git  -- git commit -am 'wip'
+permish --write-git --net -- git push
+permish --full       -- some-command-you-fully-trust  # escape hatch
 ```
 
 ### Options
 
-| Flag                | Effect                                                                   |
-| ------------------- | ------------------------------------------------------------------------ |
-| `--mode MODE`       | Required. One of `read`, `write`, `write-net`, `write-git`, `write-git-net`, `full`. |
-| `--workspace PATH`  | Override workspace root (default: cwd). Writes are confined to here.     |
-| `--read PATH`       | Grant extra read-only path. Repeatable.                                  |
-| `--write PATH`      | Grant extra writable path beyond workspace. Repeatable.                  |
-| `--quiet`           | Suppress the `[permish]` banner that prints to stderr.                 |
-| `--explain`         | Print the sandbox command that would run, then exit 0.                   |
+| Flag                  | Effect                                                               |
+| --------------------- | -------------------------------------------------------------------- |
+| `--read-local`        | Restrict reads to the workspace (default: read anywhere).            |
+| `--write`             | Allow writing to workspace + `/tmp`. `.git` stays read-only.         |
+| `--write-git`         | Allow writing to workspace including `.git` (implies `--write`).     |
+| `--net`               | Allow network access.                                                |
+| `--full`              | No restrictions. Escape hatch.                                       |
+| `--workspace PATH`    | Override workspace root (default: cwd). Writes are confined to here. |
+| `--read-path PATH`    | Grant extra read-only path. Repeatable.                              |
+| `--write-path PATH`   | Grant extra writable path beyond workspace. Repeatable.              |
+| `--quiet`             | Suppress the `[permish]` banner that prints to stderr.               |
+| `--explain`           | Print the sandbox command that would run, then exit 0.               |
 
 ### What "writes" actually means
 
@@ -99,25 +106,25 @@ profile.
 
 ## Using it with VS Code Copilot agent
 
-The trick is to make the agent prefix every shell command with `permish --mode X -- ...`,
-then use VS Code's terminal auto-approve to whitelist `permish` invocations by mode.
+The trick is to make the agent prefix every shell command with `permish [FLAGS] -- ...`,
+then use VS Code's terminal auto-approve to whitelist `permish` invocations by flags.
 
 ### 1. Tell the agent to use it
 
 Drop `.github/copilot-instructions.md` into your repo (sample in this directory). The agent
-will read it and learn to call `permish --mode <X> -- <command>` instead of bare commands.
+will read it and learn to call `permish [FLAGS] -- <command>` instead of bare commands.
 
 ### 2. Auto-approve sandboxed commands in `settings.json`
 
 ```json
 {
   "chat.tools.terminal.autoApprove": {
-    "/^permish --mode read /": true,
-    "/^permish --mode write /": true,
-    "/^permish --mode write-net /": false,
-    "/^permish --mode write-git /": false,
-    "/^permish --mode write-git-net /": false,
-    "/^permish --mode full /": false
+    "/^permish -- /": true,
+    "/^permish --read-local -- /": true,
+    "/^permish --write -- /": true,
+    "/^permish --write-git /": false,
+    "/^permish --write --net /": false,
+    "/^permish --full /": false
   }
 }
 ```
@@ -156,10 +163,11 @@ auto-approve grammar has evolved; double-check against your version.)
    `bwrap --ro-bind / / true` first; if that fails, you'll need to enable
    `kernel.unprivileged_userns_clone=1` or install the AppArmor profile for bwrap.
 
-3. **Read access is unrestricted.** By design — matching Codex. The threat we care about
-   is *mutation* and *exfiltration via network*, not reading. If you want to also restrict
-   reads (e.g. block `~/.ssh` from being read), wrap `permish` itself with another tool
-   that uses Landlock read restrictions, or extend the bwrap args to drop those paths.
+3. **`--read-local` blocks the user home dir but not the whole filesystem.** It denies
+   reading file contents outside the workspace (and a short allowlist of tool configs like
+   `~/.gitconfig`), but system paths (`/usr`, `/System`, etc.) remain readable so programs
+   can load their own binaries and libraries. If you need a stricter read boundary, extend
+   the Seatbelt profile or use a VM.
 
 4. **The agent could call shell built-ins or write to env vars to influence its parent
    process — but it can't, because the wrapped command runs in a separate process. Its
