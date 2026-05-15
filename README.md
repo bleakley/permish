@@ -121,33 +121,41 @@ will read it and learn to call `permish [FLAGS] -- <command>` instead of bare co
   "chat.tools.terminal.autoApprove": {
     "/^permish -- /": true,
     "/^permish --read-local -- /": true,
-    "/^permish --write -- /": true,
-    "/^permish --write-git /": false,
-    "/^permish --write --net /": false,
-    "/^permish --full /": false
+    "/^permish --write -- /": true
   }
 }
 ```
 
-This auto-approves `read` and `write` modes (the safe ones) and forces explicit approval
-for anything involving network, `.git`, or full access. Tune to taste.
+Any `permish` invocation not matched by a `true` pattern (e.g. `--write-git`, `--net`,
+`--full`) will fall through and require explicit approval. The `false` value exists in
+this setting but is only useful to override a broader `true` pattern — it's not needed
+here since unmatched commands default to requiring approval.
 
-### 3. Optional: lock it down
+### 3. Comparison: VS Code built-in sandboxing (`chat.agent.sandbox.enabled`)
 
-Add `chat.tools.terminal.autoReject` patterns for any bare command that *isn't* prefixed
-by `permish`. That forces the agent through the wrapper and you can't accidentally
-approve a raw command. Something like:
+VS Code 1.99+ has its own OS-level sandboxing for agent terminal commands (macOS and Linux
+only). It's worth understanding how it differs from permish.
 
-```json
-{
-  "chat.tools.terminal.autoReject": {
-    "/^(?!permish )/": true
-  }
-}
-```
+| | permish | VS Code sandbox |
+|---|---|---|
+| Per-command permissions | Yes — agent declares flags each time | No — single fixed policy for everything |
+| User sees each command | Yes — approval dialog per command | No — all commands auto-approved silently |
+| Goal | Informed approval | Zero friction |
 
-(Disclaimer: I haven't tested this exact regex against every VS Code build. The official
-auto-approve grammar has evolved; double-check against your version.)
+permish is about *informed approval*: you still confirm each command, but your confirmation
+is load-bearing because the OS enforces the declared scope. You're not auditing `git log`
+to decide if it's safe — you're confirming it's running in a read-only sandbox.
+
+VS Code's sandbox trades that per-command visibility for zero friction. If you want
+confirmation dialogs to go away entirely and are happy with a single fixed policy, it may be
+sufficient on its own. See the
+[agent sandboxing docs](https://code.visualstudio.com/docs/copilot/agents/agent-tools#_sandbox-agent-commands)
+for configuration options.
+
+Note: VS Code has no "auto-reject" mechanism. Commands not matched by a `true` pattern in
+`autoApprove` still show a confirmation dialog — the user sees them and can approve manually.
+The `false` value is only useful to override a broader `true` pattern, forcing manual approval
+for specific commands even when a catch-all would otherwise auto-approve them.
 
 ## Known limitations
 
