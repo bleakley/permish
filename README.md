@@ -9,7 +9,7 @@ what the command actually does — the OS does it for you.
 
 This is the same idea OpenAI's Codex CLI uses internally (Landlock + seccomp on Linux,
 Seatbelt on macOS), packaged as a standalone wrapper you can put in front of *any* agent —
-Copilot agent mode, Claude Code, Cursor, Cline, your own scripts, whatever.
+Copilot agent mode, Claude Code, Cursor, Cline, or your own scripts.
 
 ## What it does
 
@@ -44,7 +44,7 @@ the command and start trusting the *declared mode* instead:
 ### Linux
 
 ```bash
-sudo apt install bubblewrap            # or: dnf install bubblewrap / pacman -S bubblewrap
+sudo apt install bubblewrap
 sudo install -m 0755 permish /usr/local/bin/permish
 ```
 
@@ -52,24 +52,19 @@ sudo install -m 0755 permish /usr/local/bin/permish
 
 ```bash
 sudo install -m 0755 permish /usr/local/bin/permish
-# sandbox-exec ships with macOS — nothing to install
 ```
-
-### Windows
-
-Run inside WSL2 with bubblewrap installed. Native Windows is not supported (yet).
 
 ## Usage
 
 ```bash
-permish --              grep -r TODO .               # read only within workspace (default)
-permish --read-any   -- git log --stat master..HEAD  # need to read outside the workspace
-permish --write      -- python process.py
-permish --write --net   -- pip install requests       # in a venv inside the workspace
+permish                   -- grep -r TODO .               # read only within workspace (default)
+permish --read-any        -- git log --stat master..HEAD  # need to read outside the workspace
+permish --write           -- python process.py
+permish --write --net     -- pip install requests         # in a venv inside the workspace
 permish --write-any --net -- pip install --user requests  # touches ~/.local
-permish --write-git  -- git commit -am 'wip'
+permish --write-git       -- git commit -am 'wip'
 permish --write-git --net -- git push
-permish --full       -- some-command-you-fully-trust  # escape hatch
+permish --full            -- some-command-you-fully-trust
 ```
 
 ### Options
@@ -81,7 +76,7 @@ permish --full       -- some-command-you-fully-trust  # escape hatch
 | `--write-git`         | Allow writing to workspace including `.git` (implies `--write`).     |
 | `--write-any`         | Allow writing anywhere on the filesystem (implies `--read-any`).     |
 | `--net`               | Allow network access.                                                |
-| `--full`              | No restrictions. Escape hatch.                                       |
+| `--full`              | No restrictions.                                                     |
 | `--workspace PATH`    | Override workspace root (default: cwd). Writes are confined to here. |
 | `--read-path PATH`    | Grant extra read-only path. Repeatable.                              |
 | `--write-path PATH`   | Grant extra writable path beyond workspace. Repeatable.              |
@@ -95,8 +90,7 @@ filesystem: every user's home dir (`/Users/*` on macOS, `/home/*` on Linux), mou
 drives (`/Volumes`), and root's data. The workspace itself is re-allowed, along with a
 short tool-config allowlist (`~/.gitconfig`, `~/.config/`) so things like `git` work out
 of the box. System paths (`/usr`, `/etc`, `/System`, `/Library`) stay readable so
-programs can find their interpreter, shared libs, and dyld cache — without that, even
-`cat` fails to start.
+programs can operate normally.
 
 Everything else under those blocked trees — `~/.ssh`, other projects under your home dir,
 mounted disks, another user's files — is unreadable until you pass `--read-any`. Use
@@ -108,7 +102,7 @@ the whole filesystem.
 `permish --write` blocks writes everywhere on the filesystem **except**:
 
 - The workspace directory and below (with `.git` carved out as read-only)
-- A fresh per-invocation `$TMPDIR` (see below)
+- A fresh per-invocation temp directory on macOS (see `$TMPDIR` handling below) or a fresh `tmpfs` at `/tmp` on Linux.
 - Any extra path you pass with `--write-path`
 
 So your home directory, `/etc`, system Python's site-packages — all read-only. Use
@@ -118,18 +112,19 @@ also pass `--write-git`.
 
 ### `$TMPDIR` handling
 
-Under `--write`, `permish` creates a fresh temp directory per invocation and points the
-child's `$TMPDIR` at it. Anything using the standard temp APIs (Python `tempfile`, Go
-`os.TempDir`, Rust `env::temp_dir`, libc `mkstemp`, Node `os.tmpdir`, `NSTemporaryDirectory`)
-lands there transparently. The directory is `rm -rf`'d when the command exits.
+**Linux:** bwrap mounts a fresh kernel `tmpfs` at `/tmp` inside the sandbox's mount
+namespace. It has no connection to the host's `/tmp`, disappears when the sandbox exits,
+and `$TMPDIR` defaults to `/tmp` — so all temp APIs work without any extra env override.
 
-On Linux this is in addition to bwrap mounting a fresh `tmpfs` at `/tmp`. On macOS —
-which has no native tmpfs and where the host `/tmp` and `/var/folders/.../T/` are
-shared, persistent disk — this is the only thing that gives you the "fresh and gone
-afterwards" semantics, so it matters more.
+**macOS:** `sandbox-exec` doesn't do mount namespaces, so there is no way to give the
+child a private `/tmp`. The host `/tmp` (symlink to `/private/tmp`) and
+`/var/folders/.../T/` are real persistent disk directories shared with everything else
+running on the machine. Instead, `permish` creates a fresh directory per invocation,
+exports it as `$TMPDIR` for the child, and `rm -rf`'s it on exit. Anything using the
+standard temp APIs (Python `tempfile`, Go `os.TempDir`, Rust `env::temp_dir`,
+`NSTemporaryDirectory`, libc `mkstemp`, Node `os.tmpdir`) picks it up transparently.
 
-Tools that hardcode `/tmp/...` paths and ignore `$TMPDIR` (rare, non-idiomatic on macOS)
-will see `Operation not permitted`. Pass `--write-path /tmp` if you need to support one.
+Tools that hardcode `/tmp/...` paths and ignore `$TMPDIR` will see `Operation not permitted`. Pass `--write-path /tmp` if you need to support this.
 
 ### What "no network" actually means
 
@@ -142,8 +137,7 @@ profile.
 
 ## Using it with VS Code Copilot agent
 
-The trick is to make the agent prefix every shell command with `permish [FLAGS] -- ...`,
-then use VS Code's terminal auto-approve to whitelist `permish` invocations by flags.
+Make the agent prefix every shell command with `permish [FLAGS] -- ...`, then use VS Code's terminal auto-approve to whitelist `permish` invocations by flags.
 
 ### 1. Tell the agent to use it
 
@@ -163,9 +157,7 @@ will read it and learn to call `permish [FLAGS] -- <command>` instead of bare co
 ```
 
 Any `permish` invocation not matched by a `true` pattern (e.g. `--write-git`, `--write-any`,
-`--net`, `--full`) will fall through and require explicit approval. The `false` value
-exists in this setting but is only useful to override a broader `true` pattern — it's not
-needed here since unmatched commands default to requiring approval.
+`--net`, `--full`) will fall through and require explicit approval.
 
 ### 3. Comparison: VS Code built-in sandboxing (`chat.agent.sandbox.enabled`)
 
@@ -217,7 +209,3 @@ for specific commands even when a catch-all would otherwise auto-approve them.
 4. **The agent could call shell built-ins or write to env vars to influence its parent
    process — but it can't, because the wrapped command runs in a separate process. Its
    exit/output is the only thing that escapes.
-
-## License
-
-MIT. Do whatever you want. No warranty.
