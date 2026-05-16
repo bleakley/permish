@@ -16,7 +16,8 @@ Start with **no flags** (read-only, workspace only) and add only what the comman
 | Only reads files **within the workspace** (inspecting code, ripgrep over the repo) | *(none)*              |
 | Needs to read files **outside the workspace** (git history that touches submodules, reading another repo, `~/.gitconfig` beyond the basics, system files) | `--read-any`          |
 | Writes files in the workspace but doesn’t touch `.git/` or need network | `--write`             |
-| Writes files **and** needs network (pip install, npm install, fetching data) | `--write --net`       |
+| Writes files **and** needs network (pip install inside a venv, npm install in the repo) | `--write --net`       |
+| Writes **outside** the workspace (`pip install --user`, `npm install -g`, modifying `~/.cache`, generating files into another project) | `--write-any` (often with `--net`) |
 | Modifies git state (commit, checkout, stash, rebase) — git always writes `.git/` | `--write-git`         |
 | Pushes, pulls, fetches, or clones (git + network)        | `--write-git --net`   |
 | User explicitly asked you to bypass the sandbox          | `--full`              |
@@ -37,9 +38,13 @@ permish --read-any   -- diff -r . ../other-checkout
 permish --write      -- python -m pytest tests/
 permish --write      -- python my_script.py
 
-# Need to install something
+# Need to install something into the workspace (venv, node_modules)
 permish --write --net   -- pip install requests
 permish --write --net   -- npm install
+
+# Installing or writing outside the workspace
+permish --write-any --net -- pip install --user requests
+permish --write-any --net -- npm install -g typescript
 
 # Git mutations
 permish --write-git  -- git add -A

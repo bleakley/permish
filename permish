@@ -12,8 +12,9 @@ Usage:
 
 Permission flags (compose freely; default is workspace-only reads, no writes, no network):
     --read-any    Allow reading the whole filesystem (outside the workspace).
-    --write       Write to workspace + /tmp. .git stays read-only.
+    --write       Write to workspace + a fresh per-invocation $TMPDIR. .git stays read-only.
     --write-git   Write to workspace including .git (implies --write).
+    --write-any   Allow writing anywhere on the filesystem (implies --read-any).
     --net         Allow network access.
     --full        No restrictions. Escape hatch — equivalent to running unwrapped.
 
@@ -26,6 +27,9 @@ Examples:
 
     # Write workspace but not .git, no network
     permish --write -- python process.py < input.csv
+
+    # Need to write outside the workspace (e.g. pip install --user, npm -g)
+    permish --write-any --net -- pip install --user requests
 
     # Full access for a package install
     permish --write-git --net -- npm install
@@ -43,6 +47,9 @@ import argparse
 import os
 import platform
 import shutil
+import signal
+import subprocess
+import tempfile
 import sys
 from pathlib import Path
 from typing import List
@@ -63,7 +70,7 @@ _LINUX_SYSTEM_BIND_PATHS = [
 # -----------------------------------------------------------------------------
 
 def build_bwrap_command(
-    read_any: bool, writes: bool, write_git: bool, network: bool,
+    read_any: bool, writes: bool, write_git: bool, write_any: bool, network: bool,
     workspace: Path, command: List[str],
     read_extra: List[str], write_extra: List[str],
 ) -> List[str]:
@@ -84,7 +91,11 @@ def build_bwrap_command(
     if not network:
         args += ["--unshare-net"]
 
-    if read_any:
+    if write_any:
+        # Writes everywhere implies reads everywhere on bwrap (you can't write
+        # to a path that isn't mounted into the sandbox).
+        args += ["--bind", "/", "/"]
+    elif read_any:
         args += ["--ro-bind", "/", "/"]
     else:
         # Bind only system paths + workspace, not the full filesystem.
@@ -94,7 +105,9 @@ def build_bwrap_command(
                 args += ["--ro-bind-try", p, p]
 
     ws = str(workspace)
-    if writes:
+    if writes or write_any:
+        # Redundant when write_any (root already writable), but harmless and
+        # ensures the .git carve-out below still applies.
         args += ["--bind", ws, ws]
         if not write_git:
             git_dir = workspace / ".git"
@@ -129,8 +142,8 @@ _MACOS_BLOCKED_READ_PATHS = [
 
 
 def build_sandbox_exec_command(
-    read_any: bool, writes: bool, write_git: bool, network: bool,
-    workspace: Path, command: List[str],
+    read_any: bool, writes: bool, write_git: bool, write_any: bool, network: bool,
+    workspace: Path, tmp_dir: str, command: List[str],
     read_extra: List[str], write_extra: List[str],
 ) -> List[str]:
     parts = [
@@ -149,7 +162,7 @@ def build_sandbox_exec_command(
         '(allow file-write* (literal "/dev/null"))',
     ]
 
-    if read_any:
+    if read_any or write_any:
         parts.append("(allow file-read*)")
     else:
         # Allow reads broadly so dyld / frameworks / libs load, then deny the
@@ -159,16 +172,21 @@ def build_sandbox_exec_command(
         for p in _MACOS_BLOCKED_READ_PATHS:
             parts.append(f'(deny file-read* (subpath "{p}") (with no-log))')
         parts.append(f'(allow file-read* (subpath "{workspace}"))')
+        parts.append(f'(allow file-read* (subpath "{tmp_dir}"))')
         home = str(Path.home())
         parts.append(f'(allow file-read* (literal "{home}/.gitconfig"))')
         parts.append(f'(allow file-read* (subpath "{home}/.config"))')
 
-    if writes:
+    if write_any:
+        parts.append('(allow file-write*)')
+        if not write_git:
+            parts.append(f'(deny file-write* (subpath "{workspace}/.git"))')
+    elif writes:
         parts.append(f'(allow file-write* (subpath "{workspace}"))')
-        parts.append('(allow file-write* (subpath "/tmp"))')
-        parts.append('(allow file-write* (subpath "/private/tmp"))')
-        parts.append('(allow file-write* (subpath "/private/var/folders"))')
-        parts.append('(allow file-write* (subpath "/var/folders"))')
+        # Per-invocation TMPDIR (created by main, exposed to the child as
+        # $TMPDIR). Replaces the previous blanket writes to /tmp, /private/tmp,
+        # and /var/folders which exposed the user's whole caches dir.
+        parts.append(f'(allow file-write* (subpath "{tmp_dir}"))')
         if not write_git:
             parts.append(f'(deny file-write* (subpath "{workspace}/.git"))')
 
@@ -223,21 +241,23 @@ def detect_backend():
 
 
 def banner(
-    read_any: bool, writes: bool, write_git: bool, network: bool,
+    read_any: bool, writes: bool, write_git: bool, write_any: bool, network: bool,
     full: bool, command: List[str],
 ):
     if full:
         label, icon = "full", "⚠️"
     else:
-        parts = ["read-any" if read_any else "read"]
-        if write_git:
+        parts = ["read-any" if (read_any or write_any) else "read"]
+        if write_any:
+            parts.append("write-any")
+        elif write_git:
             parts.append("write+git")
         elif writes:
             parts.append("write")
         if network:
             parts.append("net")
         label = "+".join(parts)
-        icon = "🌐" if network else "🔧" if write_git else "✏️" if writes else "👁"
+        icon = "🌐" if network else "⚠️" if write_any else "🔧" if write_git else "✏️" if writes else "👁"
     sys.stderr.write(f"[permish] {icon} {label}  {' '.join(command)}\n")
     sys.stderr.flush()
 
@@ -254,11 +274,15 @@ def main():
     )
     parser.add_argument(
         "--write", action="store_true", dest="write",
-        help="Allow writing to workspace + /tmp. .git stays read-only.",
+        help="Allow writing to workspace + a fresh per-invocation $TMPDIR. .git stays read-only.",
     )
     parser.add_argument(
         "--write-git", action="store_true", dest="write_git",
         help="Allow writing to workspace including .git (implies --write).",
+    )
+    parser.add_argument(
+        "--write-any", action="store_true", dest="write_any",
+        help="Allow writing anywhere on the filesystem (implies --read-any).",
     )
     parser.add_argument(
         "--net", action="store_true",
@@ -304,9 +328,10 @@ def main():
     if not command:
         parser.error("no command supplied — put the command after `--`")
 
-    read_any   = args.read_any
+    read_any   = args.read_any or args.write_any
     write_git  = args.write_git
-    writes     = args.write or write_git
+    write_any  = args.write_any
+    writes     = args.write or write_git or write_any
     network    = args.net
     full       = args.full
 
@@ -316,7 +341,7 @@ def main():
         sys.exit(2)
 
     if not args.quiet:
-        banner(read_any, writes, write_git, network, full, command)
+        banner(read_any, writes, write_git, write_any, network, full, command)
 
     if full:
         if args.explain:
@@ -333,25 +358,61 @@ def main():
 
     if backend == "bwrap":
         wrapped = build_bwrap_command(
-            read_any, writes, write_git, network,
+            read_any, writes, write_git, write_any, network,
             workspace, command, args.read_extra, args.write_extra,
         )
-    else:
+        if args.explain:
+            sys.stderr.write("[permish] would exec:\n  " + " ".join(wrapped) + "\n")
+            return 0
+        # bwrap's --tmpfs /tmp already gives us a fresh, isolated temp area,
+        # so execvp is fine here.
+        try:
+            os.execvp(wrapped[0], wrapped)
+        except FileNotFoundError as e:
+            sys.stderr.write(f"permish: {e}\n")
+            sys.exit(127)
+        return
+
+    # macOS: sandbox-exec has no tmpfs equivalent. Create a fresh per-invocation
+    # temp dir, point $TMPDIR at it for the child, and rm -rf it on exit. This
+    # replaces the previous blanket writes to /tmp, /private/tmp, and /var/folders
+    # (which exposed the user's whole caches tree under /var/folders/.../C/).
+    with tempfile.TemporaryDirectory(prefix="permish-") as tmp_dir:
+        tmp_dir = str(Path(tmp_dir).resolve())
         wrapped = build_sandbox_exec_command(
-            read_any, writes, write_git, network,
-            workspace, command, args.read_extra, args.write_extra,
+            read_any, writes, write_git, write_any, network,
+            workspace, tmp_dir, command, args.read_extra, args.write_extra,
         )
+        if args.explain:
+            sys.stderr.write("[permish] would exec:\n  " + " ".join(wrapped) + "\n")
+            return 0
+        env = dict(os.environ, TMPDIR=tmp_dir + "/")
+        sys.exit(_run_and_forward(wrapped, env))
 
-    if args.explain:
-        sys.stderr.write("[permish] would exec:\n  " + " ".join(wrapped) + "\n")
-        return 0
 
-    # exec replaces this process — child's exit code becomes ours
+def _run_and_forward(cmd: List[str], env: dict) -> int:
+    """Run cmd with signal forwarding; return shell-style exit code."""
     try:
-        os.execvp(wrapped[0], wrapped)
+        proc = subprocess.Popen(cmd, env=env)
     except FileNotFoundError as e:
         sys.stderr.write(f"permish: {e}\n")
-        sys.exit(127)
+        return 127
+
+    def _forward(signum, _frame):
+        try:
+            proc.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        try:
+            signal.signal(sig, _forward)
+        except (ValueError, OSError):
+            pass
+
+    rc = proc.wait()
+    # Mirror shell convention: signal N -> exit 128+N.
+    return rc if rc >= 0 else 128 + (-rc)
 
 
 if __name__ == "__main__":

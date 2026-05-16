@@ -60,6 +60,15 @@ echo "[write mode]"
 check "can write file"    allow "$(run_ok --write -- bash -c 'echo new > file.txt')"
 check "cannot write .git" deny  "$(run_ok --write -- bash -c 'echo x > .git/HEAD')"
 check "no network"        deny  "$(run_ok --write -- python3 -c 'import socket;s=socket.socket();s.settimeout(2);s.connect(("8.8.8.8",53))')"
+check "cannot write home" deny  "$(run_ok --write -- bash -c "echo x > '$HOME/.permish-test-should-not-exist'" 2>/dev/null || echo deny)"
+check "TMPDIR is writable" allow "$(run_ok --write -- bash -c 'echo x > "$TMPDIR/probe"')"
+check "TMPDIR is set"     allow "$(run_ok --write -- bash -c '[ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]')"
+
+echo
+echo "[write-any mode]"
+check "can write home"    allow "$(run_ok --write-any -- bash -c "echo x > '$HOME/.permish-test-tmp' && rm '$HOME/.permish-test-tmp'")"
+check ".git still protected" deny "$(run_ok --write-any -- bash -c 'echo x > .git/HEAD')"
+check "read-any implied"  allow "$(run_ok --write-any -- cat /etc/hosts)"
 
 echo
 echo "[write-git mode]"

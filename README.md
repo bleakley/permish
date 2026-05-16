@@ -19,12 +19,13 @@ Flags compose freely. Start with no flags (read-only, workspace only) and add wh
 | --------------- | ------------------------------------------------------------------- |
 | *(none)*        | Read only within the workspace. No writes. No network. (default)   |
 | `--read-any`    | Allow reading the whole filesystem (other repos, `~/.ssh`, `/etc`, etc.). |
-| `--write`       | Write to workspace + `/tmp`. `.git` stays read-only.               |
+| `--write`       | Write to workspace + a fresh per-invocation `$TMPDIR`. `.git` stays read-only. |
 | `--write-git`   | Write to workspace including `.git` (implies `--write`).            |
+| `--write-any`   | Write anywhere on the filesystem (implies `--read-any`).            |
 | `--net`         | Allow network access.                                               |
 | `--full`        | No restrictions. Escape hatch.                                      |
 
-Flags combine: `--read-any --write`, `--write --net`, `--write-git --net`, etc.
+Flags combine: `--read-any --write`, `--write --net`, `--write-git --net`, `--write-any --net`, etc.
 
 `/tmp` is always a fresh tmpfs that disappears when the command exits.
 
@@ -64,7 +65,8 @@ Run inside WSL2 with bubblewrap installed. Native Windows is not supported (yet)
 permish --              grep -r TODO .               # read only within workspace (default)
 permish --read-any   -- git log --stat master..HEAD  # need to read outside the workspace
 permish --write      -- python process.py
-permish --write --net   -- pip install requests
+permish --write --net   -- pip install requests       # in a venv inside the workspace
+permish --write-any --net -- pip install --user requests  # touches ~/.local
 permish --write-git  -- git commit -am 'wip'
 permish --write-git --net -- git push
 permish --full       -- some-command-you-fully-trust  # escape hatch
@@ -75,8 +77,9 @@ permish --full       -- some-command-you-fully-trust  # escape hatch
 | Flag                  | Effect                                                               |
 | --------------------- | -------------------------------------------------------------------- |
 | `--read-any`          | Allow reading the whole filesystem (default: workspace only).        |
-| `--write`             | Allow writing to workspace + `/tmp`. `.git` stays read-only.         |
+| `--write`             | Allow writing to workspace + a fresh per-invocation `$TMPDIR`. `.git` stays read-only. |
 | `--write-git`         | Allow writing to workspace including `.git` (implies `--write`).     |
+| `--write-any`         | Allow writing anywhere on the filesystem (implies `--read-any`).     |
 | `--net`               | Allow network access.                                                |
 | `--full`              | No restrictions. Escape hatch.                                       |
 | `--workspace PATH`    | Override workspace root (default: cwd). Writes are confined to here. |
@@ -102,13 +105,31 @@ the whole filesystem.
 
 ### What "writes" actually means
 
-`permish write` blocks writes everywhere on the filesystem **except**:
+`permish --write` blocks writes everywhere on the filesystem **except**:
 
 - The workspace directory and below (with `.git` carved out as read-only)
-- `/tmp` (fresh tmpfs)
-- Any extra path you pass with `--write`
+- A fresh per-invocation `$TMPDIR` (see below)
+- Any extra path you pass with `--write-path`
 
-So your home directory, `/etc`, system Python's site-packages — all read-only.
+So your home directory, `/etc`, system Python's site-packages — all read-only. Use
+`--write-any` if the command needs to write outside the workspace (e.g. `pip install
+--user`, `npm install -g`, writing to `~/.cache`); `.git` is still protected unless you
+also pass `--write-git`.
+
+### `$TMPDIR` handling
+
+Under `--write`, `permish` creates a fresh temp directory per invocation and points the
+child's `$TMPDIR` at it. Anything using the standard temp APIs (Python `tempfile`, Go
+`os.TempDir`, Rust `env::temp_dir`, libc `mkstemp`, Node `os.tmpdir`, `NSTemporaryDirectory`)
+lands there transparently. The directory is `rm -rf`'d when the command exits.
+
+On Linux this is in addition to bwrap mounting a fresh `tmpfs` at `/tmp`. On macOS —
+which has no native tmpfs and where the host `/tmp` and `/var/folders/.../T/` are
+shared, persistent disk — this is the only thing that gives you the "fresh and gone
+afterwards" semantics, so it matters more.
+
+Tools that hardcode `/tmp/...` paths and ignore `$TMPDIR` (rare, non-idiomatic on macOS)
+will see `Operation not permitted`. Pass `--write-path /tmp` if you need to support one.
 
 ### What "no network" actually means
 
@@ -141,10 +162,10 @@ will read it and learn to call `permish [FLAGS] -- <command>` instead of bare co
 }
 ```
 
-Any `permish` invocation not matched by a `true` pattern (e.g. `--write-git`, `--net`,
-`--full`) will fall through and require explicit approval. The `false` value exists in
-this setting but is only useful to override a broader `true` pattern — it's not needed
-here since unmatched commands default to requiring approval.
+Any `permish` invocation not matched by a `true` pattern (e.g. `--write-git`, `--write-any`,
+`--net`, `--full`) will fall through and require explicit approval. The `false` value
+exists in this setting but is only useful to override a broader `true` pattern — it's not
+needed here since unmatched commands default to requiring approval.
 
 ### 3. Comparison: VS Code built-in sandboxing (`chat.agent.sandbox.enabled`)
 
