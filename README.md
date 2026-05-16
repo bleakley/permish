@@ -123,7 +123,18 @@ Drop `.github/copilot-instructions.md` into your repo (sample in this directory)
 }
 ```
 
-Any `permish` invocation not matched by a `true` pattern (e.g. `--write-git`, `--write-any`, `--net`, `--full`) will fall through and require explicit approval.
+Any `permish` invocation not matched by a `true` pattern will fall through and require explicit approval.
+
+Alternatively, you can use negative lookaheads so that flag order is irrelevant, and you can auto-approve all permish commands that don't contain forbidden flags:
+
+```json
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^permish(?!.* --(write-any|write-git|net|full)).* -- /": true,
+  }
+}
+```
+
 
 ### 3. Comparison: VS Code built-in sandboxing (`chat.agent.sandbox.enabled`)
 
