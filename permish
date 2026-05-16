@@ -46,6 +46,7 @@ License: MIT — do whatever you want.
 import argparse
 import os
 import platform
+import shlex
 import shutil
 import signal
 import subprocess
@@ -83,10 +84,6 @@ def build_bwrap_command(
         "--unshare-uts",
         "--unshare-cgroup-try",
         "--hostname", "sandbox",
-        "--proc", "/proc",
-        "--dev", "/dev",
-        "--tmpfs", "/tmp",
-        "--setenv", "TMPDIR", "/tmp/",
     ]
 
     if not network:
@@ -104,6 +101,19 @@ def build_bwrap_command(
         for p in _LINUX_SYSTEM_BIND_PATHS:
             if Path(p).exists():
                 args += ["--ro-bind-try", p, p]
+
+    # Mount proc, dev, and tmp AFTER the main filesystem binding so they
+    # overlay on top of whatever was bound above. If --dev came first and
+    # --ro-bind / / came second, the ro-bind would overwrite the devtmpfs and
+    # /dev/null would end up read-only, breaking git and many other tools.
+    args += [
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        # Mirror the macOS backend: give the child a $TMPDIR pointing at the
+        # fresh, isolated tmpfs we just mounted.
+        "--setenv", "TMPDIR", "/tmp/",
+    ]
 
     ws = str(workspace)
     if writes or write_any:
@@ -259,7 +269,7 @@ def banner(
             parts.append("net")
         label = "+".join(parts)
         icon = "🌐" if network else "⚠️" if write_any else "🔧" if write_git else "✏️" if writes else "👁"
-    sys.stderr.write(f"[permish] {icon} {label}  {' '.join(command)}\n")
+    sys.stderr.write(f"[permish] {icon} {label}  {shlex.join(command)}\n")
     sys.stderr.flush()
 
 
