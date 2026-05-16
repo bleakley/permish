@@ -180,8 +180,13 @@ def build_sandbox_exec_command(
     if network:
         parts.append("(allow network*)")
     else:
-        parts.append('(allow network* (local ip "localhost:*"))')
-        parts.append('(allow network-outbound (path "/private/var/run/mDNSResponder"))')
+        # Localhost only. We use per-operation filters because `(local ip ...)`
+        # against `network-outbound` matches the *source* address (typically
+        # 0.0.0.0 on an unbound socket), which silently allows ALL outbound
+        # traffic. For outbound we have to filter on `remote` instead.
+        parts.append('(allow network-bind (local ip "localhost:*"))')
+        parts.append('(allow network-inbound (local ip "localhost:*"))')
+        parts.append('(allow network-outbound (remote ip "localhost:*"))')
 
     profile = "\n".join(parts)
     return ["sandbox-exec", "-p", profile] + command
