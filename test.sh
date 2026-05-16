@@ -25,10 +25,10 @@ FAIL=0
 check() {
     local name="$1" expected="$2" actual="$3"
     if [ "$expected" = "$actual" ]; then
-        echo "  ✓ $name"
+        echo "  ✅ $name"
         PASS=$((PASS+1))
     else
-        echo "  ✗ $name (expected=$expected actual=$actual)"
+        echo "  ❌ $name (expected=$expected actual=$actual)"
         FAIL=$((FAIL+1))
     fi
 }

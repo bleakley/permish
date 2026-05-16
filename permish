@@ -86,6 +86,7 @@ def build_bwrap_command(
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
+        "--setenv", "TMPDIR", "/tmp/",
     ]
 
     if not network:
