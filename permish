@@ -10,19 +10,19 @@ or audit what the command actually does — the kernel does it for you.
 Usage:
     permish [FLAGS] -- COMMAND [ARGS...]
 
-Permission flags (compose freely; default is read anywhere, no writes, no network):
-    --read-local  Restrict reads to the workspace. Default allows reading anywhere.
+Permission flags (compose freely; default is workspace-only reads, no writes, no network):
+    --read-any    Allow reading the whole filesystem (outside the workspace).
     --write       Write to workspace + /tmp. .git stays read-only.
     --write-git   Write to workspace including .git (implies --write).
     --net         Allow network access.
     --full        No restrictions. Escape hatch — equivalent to running unwrapped.
 
 Examples:
-    # Read-only anywhere (default)
-    permish -- git log --stat
+    # Read-only, restricted to the workspace (default)
+    permish -- grep -r TODO .
 
-    # Restrict reads to the workspace only
-    permish --read-local -- grep -r TODO .
+    # Need to read outside the workspace (e.g. another repo, ~/.ssh/config)
+    permish --read-any -- git log --stat
 
     # Write workspace but not .git, no network
     permish --write -- python process.py < input.csv
@@ -48,10 +48,13 @@ from pathlib import Path
 from typing import List
 
 
-# System paths bound read-only in Linux --read-local mode instead of the full /
+# System paths bound read-only in default (workspace-only-reads) Linux mode.
+# Enough to let binaries find their interpreter, shared libs, and basic config,
+# but excludes /home, /root, /mnt, /media, /run/user (ssh-agent / dbus sockets),
+# /var, etc.
 _LINUX_SYSTEM_BIND_PATHS = [
     "/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32",
-    "/etc", "/run",
+    "/etc",
 ]
 
 
@@ -60,7 +63,7 @@ _LINUX_SYSTEM_BIND_PATHS = [
 # -----------------------------------------------------------------------------
 
 def build_bwrap_command(
-    read_local: bool, writes: bool, write_git: bool, network: bool,
+    read_any: bool, writes: bool, write_git: bool, network: bool,
     workspace: Path, command: List[str],
     read_extra: List[str], write_extra: List[str],
 ) -> List[str]:
@@ -81,13 +84,14 @@ def build_bwrap_command(
     if not network:
         args += ["--unshare-net"]
 
-    if read_local:
-        # Bind only system paths + workspace, not the full filesystem
+    if read_any:
+        args += ["--ro-bind", "/", "/"]
+    else:
+        # Bind only system paths + workspace, not the full filesystem.
+        # The user's home dir, other users' homes, and most of /var are absent.
         for p in _LINUX_SYSTEM_BIND_PATHS:
             if Path(p).exists():
                 args += ["--ro-bind-try", p, p]
-    else:
-        args += ["--ro-bind", "/", "/"]
 
     ws = str(workspace)
     if writes:
@@ -113,8 +117,19 @@ def build_bwrap_command(
 # macOS backend: sandbox-exec + Seatbelt
 # -----------------------------------------------------------------------------
 
+# Paths whose contents are *blocked* in default macOS mode (workspace-only reads).
+# A pure deny-default policy breaks dyld / framework loading on modern macOS,
+# so we instead allow file-read* broadly and then carve out the sensitive bits:
+# every user's home dir, mounted volumes, and the root user's data.
+_MACOS_BLOCKED_READ_PATHS = [
+    "/Users",           # every user's home dir, including the current user
+    "/Volumes",         # mounted external drives, network mounts, DMGs
+    "/private/var/root",
+]
+
+
 def build_sandbox_exec_command(
-    read_local: bool, writes: bool, write_git: bool, network: bool,
+    read_any: bool, writes: bool, write_git: bool, network: bool,
     workspace: Path, command: List[str],
     read_extra: List[str], write_extra: List[str],
 ) -> List[str]:
@@ -134,18 +149,19 @@ def build_sandbox_exec_command(
         '(allow file-write* (literal "/dev/null"))',
     ]
 
-    if read_local:
-        # Allow all reads (for metadata, xattrs, dyld cache, etc.) but block
-        # reading file *data* outside the workspace by denying home dir contents,
-        # then punching holes for the workspace and common tool configs.
-        home = str(Path.home())
+    if read_any:
         parts.append("(allow file-read*)")
-        parts.append(f'(deny file-read-data (subpath "{home}") (with no-log))')
-        parts.append(f'(allow file-read-data (subpath "{workspace}"))')
-        parts.append(f'(allow file-read-data (literal "{home}/.gitconfig"))')
-        parts.append(f'(allow file-read-data (subpath "{home}/.config"))')
     else:
+        # Allow reads broadly so dyld / frameworks / libs load, then deny the
+        # sensitive trees (all user homes, mounted volumes, root's data) and
+        # punch the workspace + a small tool-config allowlist back through.
         parts.append("(allow file-read*)")
+        for p in _MACOS_BLOCKED_READ_PATHS:
+            parts.append(f'(deny file-read* (subpath "{p}") (with no-log))')
+        parts.append(f'(allow file-read* (subpath "{workspace}"))')
+        home = str(Path.home())
+        parts.append(f'(allow file-read* (literal "{home}/.gitconfig"))')
+        parts.append(f'(allow file-read* (subpath "{home}/.config"))')
 
     if writes:
         parts.append(f'(allow file-write* (subpath "{workspace}"))')
@@ -202,13 +218,13 @@ def detect_backend():
 
 
 def banner(
-    read_local: bool, writes: bool, write_git: bool, network: bool,
+    read_any: bool, writes: bool, write_git: bool, network: bool,
     full: bool, command: List[str],
 ):
     if full:
         label, icon = "full", "⚠️"
     else:
-        parts = ["read-local" if read_local else "read"]
+        parts = ["read-any" if read_any else "read"]
         if write_git:
             parts.append("write+git")
         elif writes:
@@ -216,7 +232,7 @@ def banner(
         if network:
             parts.append("net")
         label = "+".join(parts)
-        icon = "🌐" if (network and writes) else "🔧" if write_git else "✏️" if writes else "👁"
+        icon = "🌐" if network else "🔧" if write_git else "✏️" if writes else "👁"
     sys.stderr.write(f"[permish] {icon} {label}  {' '.join(command)}\n")
     sys.stderr.flush()
 
@@ -228,8 +244,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--read-local", action="store_true",
-        help="Restrict reads to the workspace. Default allows reading anywhere.",
+        "--read-any", action="store_true",
+        help="Allow reading the whole filesystem. Default restricts reads to the workspace.",
     )
     parser.add_argument(
         "--write", action="store_true", dest="write",
@@ -283,7 +299,7 @@ def main():
     if not command:
         parser.error("no command supplied — put the command after `--`")
 
-    read_local = args.read_local
+    read_any   = args.read_any
     write_git  = args.write_git
     writes     = args.write or write_git
     network    = args.net
@@ -295,7 +311,7 @@ def main():
         sys.exit(2)
 
     if not args.quiet:
-        banner(read_local, writes, write_git, network, full, command)
+        banner(read_any, writes, write_git, network, full, command)
 
     if full:
         if args.explain:
@@ -312,12 +328,12 @@ def main():
 
     if backend == "bwrap":
         wrapped = build_bwrap_command(
-            read_local, writes, write_git, network,
+            read_any, writes, write_git, network,
             workspace, command, args.read_extra, args.write_extra,
         )
     else:
         wrapped = build_sandbox_exec_command(
-            read_local, writes, write_git, network,
+            read_any, writes, write_git, network,
             workspace, command, args.read_extra, args.write_extra,
         )
 

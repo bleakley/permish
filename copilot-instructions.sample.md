@@ -9,12 +9,12 @@ fails with a clear error and you can retry with broader flags.
 
 ## Picking the flags
 
-Start with **no flags** (read-only, anywhere) and add only what the command needs:
+Start with **no flags** (read-only, workspace only) and add only what the command needs:
 
 | If the command…                                          | Flags to add          |
 | -------------------------------------------------------- | --------------------- |
-| Only reads files (inspecting code, querying git history without checkout) | *(none)*              |
-| Should only read files **within the workspace** (block reading `~/.ssh`, other projects) | `--read-local`        |
+| Only reads files **within the workspace** (inspecting code, ripgrep over the repo) | *(none)*              |
+| Needs to read files **outside the workspace** (git history that touches submodules, reading another repo, `~/.gitconfig` beyond the basics, system files) | `--read-any`          |
 | Writes files in the workspace but doesn’t touch `.git/` or need network | `--write`             |
 | Writes files **and** needs network (pip install, npm install, fetching data) | `--write --net`       |
 | Modifies git state (commit, checkout, stash, rebase) — git always writes `.git/` | `--write-git`         |
@@ -24,14 +24,14 @@ Start with **no flags** (read-only, anywhere) and add only what the command need
 ## Examples
 
 ```bash
-# Investigating: read-only is enough
-permish --              git log --oneline -20
+# Investigating inside the workspace: no flags needed
 permish --              rg "TODO" --type py
+permish --              git log --oneline -20
 permish --              pytest --collect-only
 
-# Read only within the workspace (blocks ~/.ssh, other projects, etc.)
-permish --read-local -- grep -r TODO .
-permish --read-local -- cat README.md
+# Reading something outside the workspace
+permish --read-any   -- cat ~/.config/git/config
+permish --read-any   -- diff -r . ../other-checkout
 
 # Editing files and running tests: write
 permish --write      -- python -m pytest tests/
@@ -52,7 +52,14 @@ permish --write-git --net -- git pull --rebase
 
 ## What happens when you pick wrong
 
-If you declare no flags but the command tries to write, you'll see:
+If the command tries to read outside the workspace without `--read-any`, you'll see:
+
+```
+... : Operation not permitted
+... : No such file or directory
+```
+
+If it tries to write without `--write`:
 
 ```
 ... : Read-only file system

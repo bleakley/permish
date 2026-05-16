@@ -13,18 +13,18 @@ Copilot agent mode, Claude Code, Cursor, Cline, your own scripts, whatever.
 
 ## What it does
 
-Flags compose freely. Start with no flags (read-only, anywhere) and add what you need:
+Flags compose freely. Start with no flags (read-only, workspace only) and add what you need:
 
 | Flag            | Effect                                                              |
 | --------------- | ------------------------------------------------------------------- |
-| *(none)*        | Read anywhere on the filesystem. No writes. No network. (default)  |
-| `--read-local`  | Restrict reads to the workspace. Blocks reading `~/.ssh`, other projects, etc. |
+| *(none)*        | Read only within the workspace. No writes. No network. (default)   |
+| `--read-any`    | Allow reading the whole filesystem (other repos, `~/.ssh`, `/etc`, etc.). |
 | `--write`       | Write to workspace + `/tmp`. `.git` stays read-only.               |
 | `--write-git`   | Write to workspace including `.git` (implies `--write`).            |
 | `--net`         | Allow network access.                                               |
 | `--full`        | No restrictions. Escape hatch.                                      |
 
-Flags combine: `--write --net`, `--write-git --net`, `--read-local --write`, etc.
+Flags combine: `--read-any --write`, `--write --net`, `--write-git --net`, etc.
 
 `/tmp` is always a fresh tmpfs that disappears when the command exits.
 
@@ -61,8 +61,8 @@ Run inside WSL2 with bubblewrap installed. Native Windows is not supported (yet)
 ## Usage
 
 ```bash
-permish --              git log --stat master..HEAD  # read anywhere (default)
-permish --read-local -- grep -r TODO .               # read only within workspace
+permish --              grep -r TODO .               # read only within workspace (default)
+permish --read-any   -- git log --stat master..HEAD  # need to read outside the workspace
 permish --write      -- python process.py
 permish --write --net   -- pip install requests
 permish --write-git  -- git commit -am 'wip'
@@ -74,7 +74,7 @@ permish --full       -- some-command-you-fully-trust  # escape hatch
 
 | Flag                  | Effect                                                               |
 | --------------------- | -------------------------------------------------------------------- |
-| `--read-local`        | Restrict reads to the workspace (default: read anywhere).            |
+| `--read-any`          | Allow reading the whole filesystem (default: workspace only).        |
 | `--write`             | Allow writing to workspace + `/tmp`. `.git` stays read-only.         |
 | `--write-git`         | Allow writing to workspace including `.git` (implies `--write`).     |
 | `--net`               | Allow network access.                                                |
@@ -84,6 +84,21 @@ permish --full       -- some-command-you-fully-trust  # escape hatch
 | `--write-path PATH`   | Grant extra writable path beyond workspace. Repeatable.              |
 | `--quiet`             | Suppress the `[permish]` banner that prints to stderr.               |
 | `--explain`           | Print the sandbox command that would run, then exit 0.               |
+
+### What "reads" actually means
+
+By default, `permish` blocks reads of file contents in the sensitive parts of the
+filesystem: every user's home dir (`/Users/*` on macOS, `/home/*` on Linux), mounted
+drives (`/Volumes`), and root's data. The workspace itself is re-allowed, along with a
+short tool-config allowlist (`~/.gitconfig`, `~/.config/`) so things like `git` work out
+of the box. System paths (`/usr`, `/etc`, `/System`, `/Library`) stay readable so
+programs can find their interpreter, shared libs, and dyld cache — without that, even
+`cat` fails to start.
+
+Everything else under those blocked trees — `~/.ssh`, other projects under your home dir,
+mounted disks, another user's files — is unreadable until you pass `--read-any`. Use
+`--read-path PATH` to grant access to one specific extra location instead of opening up
+the whole filesystem.
 
 ### What "writes" actually means
 
@@ -120,7 +135,7 @@ will read it and learn to call `permish [FLAGS] -- <command>` instead of bare co
 {
   "chat.tools.terminal.autoApprove": {
     "/^permish -- /": true,
-    "/^permish --read-local -- /": true,
+    "/^permish --read-any -- /": true,
     "/^permish --write -- /": true
   }
 }
@@ -171,11 +186,12 @@ for specific commands even when a catch-all would otherwise auto-approve them.
    `bwrap --ro-bind / / true` first; if that fails, you'll need to enable
    `kernel.unprivileged_userns_clone=1` or install the AppArmor profile for bwrap.
 
-3. **`--read-local` blocks the user home dir but not the whole filesystem.** It denies
-   reading file contents outside the workspace (and a short allowlist of tool configs like
-   `~/.gitconfig`), but system paths (`/usr`, `/System`, etc.) remain readable so programs
-   can load their own binaries and libraries. If you need a stricter read boundary, extend
-   the Seatbelt profile or use a VM.
+3. **The default mode is a deny-*list*, not deny-default.** It blocks the obviously
+   sensitive trees (`/Users/*`, `/home/*`, `/Volumes`, root's data) and re-allows the
+   workspace, but system paths like `/usr`, `/etc`, `/System`, `/Library` remain readable
+   so programs can load their libraries. On macOS, file *metadata* (existence, size) is
+   readable anywhere so directory traversal doesn't break. If you need a true read
+   boundary against a curious agent, use a VM.
 
 4. **The agent could call shell built-ins or write to env vars to influence its parent
    process — but it can't, because the wrapped command runs in a separate process. Its

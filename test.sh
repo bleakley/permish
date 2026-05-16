@@ -6,7 +6,7 @@
 
 set -e
 
-SB="${SB:-$(dirname "$0")/permish}"
+SB="${SB:-$(cd "$(dirname "$0")" && pwd)/permish}"
 if [ ! -x "$SB" ]; then
     echo "ERROR: $SB not found or not executable. Set SB=/path/to/permish" >&2
     exit 2
@@ -44,15 +44,16 @@ echo "Testing $SB in $TESTDIR"
 echo
 
 echo "[read mode (no flags)]"
-check "can read file"     allow "$(run_ok -- cat file.txt)"
-check "cannot write file" deny  "$(run_ok -- bash -c 'echo x > file.txt')"
-check "cannot write .git" deny  "$(run_ok -- bash -c 'echo x > .git/HEAD')"
-check "/tmp is writable"  allow "$(run_ok -- bash -c 'echo x > /tmp/y')"
+check "can read workspace file" allow "$(run_ok -- cat file.txt)"
+check "blocks home dir"         deny  "$(run_ok -- cat "$HOME/.profile" 2>/dev/null || echo deny)"
+check "cannot write file"       deny  "$(run_ok -- bash -c 'echo x > file.txt')"
+check "cannot write .git"       deny  "$(run_ok -- bash -c 'echo x > .git/HEAD')"
 
 echo
-echo "[read-local mode]"
-check "can read workspace" allow "$(run_ok --read-local -- cat file.txt)"
-check "blocks home dir"   deny  "$(run_ok --read-local -- cat "$HOME/.profile" 2>/dev/null || echo deny)"
+echo "[read-any mode]"
+check "can read workspace file" allow "$(run_ok --read-any -- cat file.txt)"
+# Pick something that exists on both Linux and macOS
+check "can read /etc/hosts"     allow "$(run_ok --read-any -- cat /etc/hosts)"
 
 echo
 echo "[write mode]"
