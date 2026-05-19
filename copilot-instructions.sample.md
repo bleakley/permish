@@ -9,7 +9,7 @@ Start with no flags and add only what's needed:
 | Command needs to…                                   | Flags                 |
 | --------------------------------------------------- | --------------------- |
 | Read inside the workspace only                      | *(none)*              |
-| Read outside the workspace (other repos, `/etc`, `~`) | `--read-any`          |
+| Read outside the workspace (other repos, `~/.ssh`, `/Volumes`) | `--read-any`          |
 | Write inside the workspace (not `.git/`), no network | `--write`             |
 | Write inside the workspace + network (e.g. `pip install` in a venv) | `--write --net`       |
 | Modify git state (commit, checkout, stash, rebase)  | `--write-git`         |

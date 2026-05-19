@@ -56,6 +56,32 @@ from pathlib import Path
 from typing import List
 
 
+def _path_tool_roots() -> List[str]:
+    """Return unique first-level directories under $HOME that appear in $PATH.
+
+    Tool managers like nvm, pyenv, volta, and rbenv install runtimes under
+    ~/.nvm/, ~/.pyenv/, ~/.volta/ etc. and put their bin/ dirs on $PATH.  The
+    user made an explicit trust decision by doing so, so permish grants read
+    access to those roots automatically — no --read-any flag needed just to
+    invoke a tool installed through one of these managers.
+    """
+    home = Path.home()
+    seen: set = set()
+    roots: List[str] = []
+    for d in os.environ.get("PATH", "").split(":"):
+        if not d:
+            continue
+        try:
+            rel = Path(d).relative_to(home)
+            root = str(home / rel.parts[0])
+            if root not in seen:
+                seen.add(root)
+                roots.append(root)
+        except (ValueError, IndexError):
+            pass
+    return roots
+
+
 # System paths bound read-only in default (workspace-only-reads) Linux mode.
 # Enough to let binaries find their interpreter, shared libs, and basic config,
 # but excludes /home, /root, /mnt, /media, /run/user (ssh-agent / dbus sockets),
@@ -101,6 +127,12 @@ def build_bwrap_command(
         for p in _LINUX_SYSTEM_BIND_PATHS:
             if Path(p).exists():
                 args += ["--ro-bind-try", p, p]
+        # Also bind any tool-manager roots the user has on $PATH (e.g. ~/.nvm,
+        # ~/.pyenv, ~/.volta).  These are read-only runtime installs; letting
+        # the sandbox see them avoids needing --read-any just to run npm/python.
+        for root in _path_tool_roots():
+            if Path(root).exists():
+                args += ["--ro-bind-try", root, root]
 
     # Mount proc, dev, and tmp AFTER the main filesystem binding so they
     # overlay on top of whatever was bound above. If --dev came first and
@@ -187,6 +219,12 @@ def build_sandbox_exec_command(
         home = str(Path.home())
         parts.append(f'(allow file-read* (literal "{home}/.gitconfig"))')
         parts.append(f'(allow file-read* (subpath "{home}/.config"))')
+        # Re-allow tool-manager roots (e.g. ~/.nvm, ~/.pyenv, ~/.volta) that
+        # the user has on $PATH.  They were denied by the /Users carve-out
+        # above, but the user made an explicit trust choice by putting them on
+        # $PATH, so grant read access without requiring --read-any.
+        for root in _path_tool_roots():
+            parts.append(f'(allow file-read* (subpath "{root}"))')
 
     if write_any:
         parts.append('(allow file-write*)')

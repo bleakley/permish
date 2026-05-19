@@ -77,9 +77,22 @@ permish --full            -- some-command-you-fully-trust
 
 ### What "reads" actually means
 
-By default, `permish` blocks reads of file contents in the sensitive parts of the filesystem: every user's home dir (`/Users/*` on macOS, `/home/*` on Linux), mounted drives (`/Volumes`), and root's data. The workspace itself is re-allowed, along with a short tool-config allowlist (`~/.gitconfig`, `~/.config/`) so things like `git` work out of the box. System paths (`/usr`, `/etc`, `/System`, `/Library`) stay readable so programs can operate normally.
+By default, `permish` blocks reads of file contents in the sensitive parts of the
+filesystem: every user's home dir (`/Users/*` on macOS, `/home/*` on Linux), mounted
+drives (`/Volumes`), and root's data. The workspace itself is re-allowed, along with:
 
-Everything else under those blocked trees — `~/.ssh`, other projects under your home dir, mounted disks, another user's files — is unreadable until you pass `--read-any`. Use `--read-path PATH` to grant access to one specific extra location instead of opening up the whole filesystem.
+- `~/.gitconfig`, `~/.config/` (so `git` works out of the box)
+- Any first-level directory under `$HOME` that appears in `$PATH` — e.g. `~/.nvm`,
+  `~/.pyenv`, `~/.volta`, `~/.rbenv`. The user already made an explicit trust decision
+  by putting those bin dirs on their path.
+
+System paths (`/usr`, `/etc`, `/System`, `/Library`) stay readable so programs can
+find their interpreter, shared libs, and dyld cache.
+
+Everything else under those blocked trees — `~/.ssh`, other projects under your home
+dir, mounted disks, another user's files — is unreadable until you pass `--read-any`.
+Use `--read-path PATH` to grant access to one specific extra location instead of
+opening up the whole filesystem.
 
 ### What "writes" actually means
 
